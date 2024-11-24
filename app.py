@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_chat import message
 import os
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -11,18 +12,16 @@ from langchain_community.document_loaders import PyPDFLoader
 from dotenv import load_dotenv
 import tempfile
 
-
 load_dotenv()
 
-
+# Get Groq API key
 groq_api_key = os.getenv('GROQ_API_KEY')
 
+# Title
+st.markdown("<h2 style='text-align: center;'>Chat with Your PDF: Powered by Llama3 & Groq API</h2>", unsafe_allow_html=True)
 
-st.markdown("<h2 style='text-align: center;'>PDF Insights: Interactive Q&A with Llama3 & Groq API</h2>", unsafe_allow_html=True)
-
-
+# Initialize LLM and Prompt
 llm = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
-
 
 prompt = ChatPromptTemplate.from_template(
     """
@@ -35,73 +34,98 @@ prompt = ChatPromptTemplate.from_template(
     """
 )
 
+# Initialize session state
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []  # Initialize chat history
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None  # Initialize vector store
+if "uploaded_pdf" not in st.session_state:
+    st.session_state.uploaded_pdf = None  # Track the uploaded PDF file
+if "pending_input" not in st.session_state:
+    st.session_state.pending_input = ""  # Temporary storage for user input
+if "processing" not in st.session_state:
+    st.session_state.processing = False  # Prevent duplicate processing
+
 def create_vector_db_out_of_the_uploaded_pdf_file(pdf_file):
+    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        temp_file.write(pdf_file.read())
+        pdf_file_path = temp_file.name
 
+    st.session_state.embeddings = HuggingFaceEmbeddings(
+        model_name='BAAI/bge-small-en-v1.5', 
+        model_kwargs={'device': 'cpu'}, 
+        encode_kwargs={'normalize_embeddings': True}
+    )
 
-    if "vector_store" not in st.session_state:
+    loader = PyPDFLoader(pdf_file_path)
+    text_documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    document_chunks = text_splitter.split_documents(text_documents)
+    st.session_state.vector_store = FAISS.from_documents(document_chunks, st.session_state.embeddings)
 
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-
-            temp_file.write(pdf_file.read())
-
-            pdf_file_path = temp_file.name
-
-        st.session_state.embeddings = HuggingFaceEmbeddings(model_name='BAAI/bge-small-en-v1.5', model_kwargs={'device': 'cpu'}, encode_kwargs={'normalize_embeddings': True})
-        
-        st.session_state.loader = PyPDFLoader(pdf_file_path)
-
-        st.session_state.text_document_from_pdf = st.session_state.loader.load()
-
-        st.session_state.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        
-        st.session_state.final_document_chunks = st.session_state.text_splitter.split_documents(st.session_state.text_document_from_pdf)
-
-        st.session_state.vector_store = FAISS.from_documents(st.session_state.final_document_chunks, st.session_state.embeddings)
-
-
-pdf_input_from_user = st.file_uploader("Upload the PDF file", type=['pdf'])
-
+# Sidebar for PDF Upload and Embedding
+st.sidebar.markdown("### Upload PDF and Create Vector DB")
+pdf_input_from_user = st.sidebar.file_uploader("Upload the PDF file", type=['pdf'])
 
 if pdf_input_from_user is not None:
-
-    if st.button("Create the Vector DB from the uploaded PDF file"):
-        
-        if pdf_input_from_user is not None:
-            
+    if st.sidebar.button("Create the Vector DB from the uploaded PDF file"):
+        # Check if the file is new or has changed
+        if (
+            st.session_state.uploaded_pdf is None
+            or st.session_state.uploaded_pdf.name != pdf_input_from_user.name
+        ):
+            st.session_state.uploaded_pdf = pdf_input_from_user  # Update the stored PDF
             create_vector_db_out_of_the_uploaded_pdf_file(pdf_input_from_user)
-            
-            st.success("Vector Store DB for this PDF file Is Ready")
-        
+            st.sidebar.success("Vector Store DB for this PDF file is ready!")
         else:
-            
-            st.write("Please upload a PDF file first")
+            st.sidebar.info("Vector store already exists for the uploaded PDF.")
+else:
+    st.sidebar.warning("Please upload a PDF file to create a vector store.")
 
+# Chat Interface
+st.markdown("### Chat with Your PDF")
 
+# Render chat history using streamlit-chat
+for i, chat in enumerate(st.session_state.chat_history):
+    role = chat["role"]
+    content = chat["content"]
+    is_user = role == "user"
+    message(content, is_user=is_user, key=f"message_{i}")
 
-if "vector_store" in st.session_state:
+# Input box and send button side-by-side
+col1, col2 = st.columns([4, 1])  # Adjust proportions as needed
+with col1:
+    user_input = st.text_input(
+        "",
+        value=st.session_state.pending_input,
+        placeholder="Ask something about the PDF...",
+        key="user_input"
+    )
 
-    user_prompt = st.text_input("Enter Your Question related to the uploaded PDF")
+with col2:
+    send_clicked = st.button("Send")
 
-    if st.button('Submit Prompt'):
+# Process user input after the "Send" button is clicked
+if send_clicked and not st.session_state.processing:
+    if user_input.strip():
+        st.session_state.processing = True  # Lock processing
+        st.session_state.pending_input = ""  # Clear the input field
 
-        if user_prompt:
-            
-            if "vector_store" in st.session_state:
+        # Append user message to history
+        st.session_state.chat_history.append({"role": "user", "content": user_input.strip()})
 
-                document_chain = create_stuff_documents_chain(llm, prompt)
+        # Process the input
+        if st.session_state.vector_store:
+            document_chain = create_stuff_documents_chain(llm, prompt)
+            retriever = st.session_state.vector_store.as_retriever()
+            retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
-                retriever = st.session_state.vector_store.as_retriever()
-
-                retrieval_chain = create_retrieval_chain(retriever, document_chain)
-
-                response = retrieval_chain.invoke({'input': user_prompt})
-
-                st.write(response['answer'])
-
-            else:
-
-                st.write("Please embed the document first by uploading a PDF file.")
-
+            response = retrieval_chain.invoke({'input': user_input.strip()})
+            bot_reply = response['answer']
         else:
+            bot_reply = "Please upload a PDF and create the vector store before asking questions."
 
-            st.error('Please write your prompt')
+        # Append bot reply to history
+        st.session_state.chat_history.append({"role": "bot", "content": bot_reply})
+
+        st.session_state.processing = False  # Unlock processing
